@@ -1,7 +1,8 @@
-"""Image encoder for LiteMedSAM with multi-scale feature extraction."""
+"""Image encoder for LiteMedSAM with PraNet-V2 architecture and exposure correction."""
 
 import torch
 import torch.nn as nn
+from .common import ExposureCorrection, PartialDecoder, FeatureFusion
 
 
 class ResidualBlock(nn.Module):
@@ -67,16 +68,20 @@ class ResidualBlock(nn.Module):
 
 
 class LiteImageEncoder(nn.Module):
-    """Lightweight image encoder with multi-scale feature extraction.
+    """Enhanced image encoder with PraNet-V2 architecture and exposure correction.
     
     Architecture:
     - Stem: Initial 7x7 convolution + MaxPool
     - 4 residual layers with progressive downsampling
-    - Final projection to embedding dimension
+    - Exposure correction branch at each stage
+    - Partial Decoder (PD) for coarse mask generation
+    - Feature fusion combining spatial and exposure features
     
     Output:
-    - Features at 1/16 resolution with embedding dimension
-    - Skip connections for potential decoder use
+    - Multi-scale spatial features (F2, F3, F4)
+    - Multi-scale exposure correction features
+    - Coarse masks at each scale
+    - Dual supervision masks (background and foreground)
     """
     
     def __init__(self, in_channels=1, out_channels=256, base_channels=32):
@@ -132,6 +137,27 @@ class LiteImageEncoder(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+        
+        # ============ Exposure Correction Modules ============
+        # Extract exposure correction features at each stage
+        self.exposure_f2 = ExposureCorrection(base_channels)
+        self.exposure_f3 = ExposureCorrection(base_channels * 2)
+        self.exposure_f4 = ExposureCorrection(base_channels * 4)
+        self.exposure_final = ExposureCorrection(base_channels * 4)  # x4 has base_channels*4 channels before projection
+        
+        # ============ Partial Decoder (PD) Modules ============
+        # Generate coarse masks from each stage features
+        self.pd_f2 = PartialDecoder(base_channels, out_channels=1)
+        self.pd_f3 = PartialDecoder(base_channels * 2, out_channels=1)
+        self.pd_f4 = PartialDecoder(base_channels * 4, out_channels=1)
+        self.pd_final = PartialDecoder(out_channels, out_channels=1)
+        
+        # ============ Feature Fusion Modules ============
+        # Fuse spatial features with exposure correction features
+        self.fusion_f2 = FeatureFusion(base_channels, exposure_channels=3)
+        self.fusion_f3 = FeatureFusion(base_channels * 2, exposure_channels=3)
+        self.fusion_f4 = FeatureFusion(base_channels * 4, exposure_channels=3)
+        self.fusion_final = FeatureFusion(base_channels * 4, exposure_channels=3)  # x4 has base_channels*4 channels before projection
     
     def _make_layer(self, in_channels, out_channels, num_blocks, stride):
         """Create a residual block layer.
@@ -161,31 +187,69 @@ class LiteImageEncoder(nn.Module):
         return nn.Sequential(*layers)
     
     def forward(self, x):
-        """Extract multi-scale features from image.
+        """Extract multi-scale features with exposure correction and coarse masks.
         
         Args:
             x: Input image [B, C, H, W]
             
         Returns:
             features: Encoded features [B, out_channels, H/16, W/16]
+            exposure_features: List of exposure correction features at each scale
+            coarse_masks: List of coarse masks at each scale
+            dual_masks: Dict with 'bg' and 'fg' masks for dual supervision
             skip_connections: List of intermediate features for skip connections
-                - skip_connections[0]: features at 1/4 resolution
-                - skip_connections[1]: features at 1/8 resolution
-                - skip_connections[2]: features at 1/16 resolution (before proj)
         """
         # Stem
         x0 = self.stem(x)  # 1/4 resolution
         
-        # Encoder stages with skip connections
+        # ============ Stage 1 ============
         x1 = self.layer1(x0)  # 1/4 resolution
-        x2 = self.layer2(x1)  # 1/8 resolution
-        x3 = self.layer3(x2)  # 1/16 resolution
-        x4 = self.layer4(x3)  # 1/16 resolution
+        exp_x1, illum_x1 = self.exposure_f2(x1)
+        x1_fused = self.fusion_f2(x1, exp_x1)
+        coarse_mask_1, bg_mask_1, fg_mask_1 = self.pd_f2(x1_fused)
+        
+        # ============ Stage 2 ============
+        x2 = self.layer2(x1_fused)  # 1/8 resolution
+        exp_x2, illum_x2 = self.exposure_f3(x2)
+        x2_fused = self.fusion_f3(x2, exp_x2)
+        coarse_mask_2, bg_mask_2, fg_mask_2 = self.pd_f3(x2_fused)
+        
+        # ============ Stage 3 ============
+        x3 = self.layer3(x2_fused)  # 1/16 resolution
+        exp_x3, illum_x3 = self.exposure_f4(x3)
+        x3_fused = self.fusion_f4(x3, exp_x3)
+        coarse_mask_3, bg_mask_3, fg_mask_3 = self.pd_f4(x3_fused)
+        
+        # ============ Stage 4 ============
+        x4 = self.layer4(x3_fused)  # 1/16 resolution
+        exp_x4, illum_x4 = self.exposure_final(x4)
+        x4_fused = self.fusion_final(x4, exp_x4)
         
         # Final projection
-        features = self.final_proj(x4)  # 1/16 resolution
+        features = self.final_proj(x4_fused)  # 1/16 resolution
+        coarse_mask_4, bg_mask_4, fg_mask_4 = self.pd_final(features)
+        
+        # Store all coarse masks
+        coarse_masks = [coarse_mask_1, coarse_mask_2, coarse_mask_3, coarse_mask_4]
+        
+        # Store dual supervision masks
+        dual_masks = {
+            'bg': [bg_mask_1, bg_mask_2, bg_mask_3, bg_mask_4],
+            'fg': [fg_mask_1, fg_mask_2, fg_mask_3, fg_mask_4]
+        }
+        
+        # Store exposure correction features
+        exposure_features = [exp_x1, exp_x2, exp_x3, exp_x4]
+        illumination_maps = [illum_x1, illum_x2, illum_x3, illum_x4]
         
         # Store skip connections for decoder
-        skip_connections = [x1, x2, x3, x4]
+        skip_connections = [x1_fused, x2_fused, x3_fused, x4_fused]
         
-        return features, skip_connections
+        return {
+            'features': features,
+            'coarse_masks': coarse_masks,  # For prompt encoder
+            'dual_masks': dual_masks,  # For mask decoder guidance
+            'exposure_features': exposure_features,
+            'illumination_maps': illumination_maps,
+            'skip_connections': skip_connections
+        }

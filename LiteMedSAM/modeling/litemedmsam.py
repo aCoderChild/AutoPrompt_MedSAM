@@ -1,4 +1,4 @@
-"""LiteMedSAM: Lightweight Medical Image Segmentation Model."""
+"""LiteMedSAM: Lightweight Medical Image Segmentation Model with PraNet-V2 and Exposure Correction."""
 
 import torch
 import torch.nn as nn
@@ -9,24 +9,36 @@ from .mask_decoder import LiteDecoder
 
 
 class LiteMedSAM(nn.Module):
-    """Lightweight Medical Segment Anything Model.
+    """Lightweight Medical Segment Anything Model with PraNet-V2 + WTNet.
     
-    A lightweight version of MedSAM optimized for medical image segmentation with:
-    - Efficient image encoder (multi-scale CNN with residual blocks)
-    - Flexible prompt encoder (supports bbox, points, masks)
-    - Lightweight mask decoder (progressive upsampling)
+    Integrates:
+    - PraNet-V2 encoder-decoder architecture with DSRA modules
+    - WTNet exposure correction for handling illumination variations
+    - Multi-scale coarse mask generation from encoder
+    - Dual supervision (background + foreground) in decoder
+    - Wise-multiplication fusion of spatial and exposure features
     
     Key features:
     - ~10M parameters (vs 95M for SAM)
     - ~0.3s inference per 2D image (vs 2.5s for MedSAM)
     - 2GB GPU memory (vs 8GB for MedSAM)
-    - Prompt-aware decoding
-    - Multi-prompt support
+    - Robust to exposure variations
+    - Hierarchical multi-scale guidance
     
     Architecture:
-        Image Encoder -> Features
-        Prompt Encoder -> Prompt Embedding
-        Features + Prompt Embedding -> Mask Decoder -> Segmentation
+        Input Image
+           ↓
+        Image Encoder (with exposure correction & partial decoder)
+           ↓
+        Multi-scale features + Coarse masks + Dual masks + Exposure features
+           ↓
+        Prompt Encoder (uses coarse mask as primary prompt)
+           ↓
+        Prompt Embedding
+           ↓
+        Mask Decoder (with DSRA modules & exposure correction)
+           ↓
+        Final Segmentation (+ background prediction + auxiliary outputs)
     """
     
     def __init__(
@@ -39,7 +51,7 @@ class LiteMedSAM(nn.Module):
         embed_dim=256,
         base_channels=32
     ):
-        """Initialize LiteMedSAM model.
+        """Initialize LiteMedSAM with PraNet-V2 + Exposure Correction.
         
         Args:
             image_encoder_args: Dict of args for image encoder (optional)
@@ -59,7 +71,8 @@ class LiteMedSAM(nn.Module):
         self.base_channels = base_channels
         
         # ============ Image Encoder ============
-        # Extracts multi-scale features from input image
+        # Extracts multi-scale features, exposure correction features,
+        # coarse masks, and dual supervision masks
         image_encoder_args = image_encoder_args or {}
         self.image_encoder = LiteImageEncoder(
             in_channels=image_encoder_args.get('in_channels', in_channels),
@@ -68,63 +81,98 @@ class LiteMedSAM(nn.Module):
         )
         
         # ============ Prompt Encoder ============
-        # Encodes various prompt types (bounding boxes, points, masks)
+        # Encodes coarse mask from encoder as primary prompt
+        # Supports exposure correction features integration
         prompt_encoder_args = prompt_encoder_args or {}
         self.prompt_encoder = PromptEncoder(
             embed_dim=prompt_encoder_args.get('embed_dim', embed_dim)
         )
         
         # ============ Mask Decoder ============
-        # Progressively upsamples features to generate segmentation mask
+        # Progressively upsamples with DSRA modules
+        # Uses multi-scale guidance from encoder
+        # Incorporates exposure correction decoding
         mask_decoder_args = mask_decoder_args or {}
         self.mask_decoder = LiteDecoder(
             input_dim=mask_decoder_args.get('input_dim', embed_dim),
             hidden_dim=mask_decoder_args.get('hidden_dim', base_channels * 4),
-            output_dim=mask_decoder_args.get('output_dim', out_channels)
+            output_dim=mask_decoder_args.get('output_dim', out_channels),
+            base_channels=mask_decoder_args.get('base_channels', base_channels)
         )
     
     def forward(self, image, bbox=None, points=None, mask_prompt=None):
-        """Forward pass with prompt-based segmentation.
+        """Forward pass with guided multi-scale decoding.
         
         Args:
             image: Input image [B, C, H, W]
-            bbox: Bounding box prompts [B, 4] (optional)
+            bbox: Bounding box prompts [B, 4] (optional, secondary)
                   Format: [x_min, y_min, x_max, y_max]
-            points: Point prompts [B, 2] (optional)
+            points: Point prompts [B, 2] (optional, secondary)
                     Format: [x, y]
-            mask_prompt: Mask prompts [B, 1, H, W] (optional)
+            mask_prompt: Mask prompts [B, 1, H, W] (optional, secondary)
                         Binary mask indicating region of interest
             
         Returns:
-            logits: Segmentation logits [B, out_channels, H, W]
-            aux_logits: Auxiliary output at 1/4 resolution for intermediate supervision
+            outputs: Dict containing:
+                - 'logits': Segmentation logits [B, out_channels, H, W]
+                - 'bg_logits': Background logits [B, 1, H, W]
+                - 'aux_logits': Auxiliary foreground output at 1/4 resolution
+                - 'aux_bg_logits': Auxiliary background output at 1/4 resolution
+                - 'coarse_masks': List of coarse masks from encoder
+                - 'confidence': Prompt confidence score
             
         Note:
-            - Exactly one of (bbox, points, mask_prompt) should be provided
-            - If none provided, uses learnable prompt token
+            - Primary prompt: Coarse mask from encoder's Partial Decoder
+            - Secondary prompts: bbox, points, mask_prompt (used if coarse mask unavailable)
+            - Model automatically combines spatial features with exposure correction features
         """
         
         # ============ Encode Image ============
         # Extract multi-scale features from input
-        features, skip_connections = self.image_encoder(image)
+        encoder_outputs = self.image_encoder(image)
+        features = encoder_outputs['features']  # [B, embed_dim, H/16, W/16]
+        coarse_masks = encoder_outputs['coarse_masks']
+        illumination_maps = encoder_outputs['illumination_maps']
+        
+        # Get coarse mask from most detailed level (last one at highest resolution)
+        coarse_mask = coarse_masks[-1] if coarse_masks[-1] is not None else None
+        illumination_map = illumination_maps[-1] if illumination_maps[-1] is not None else None
         
         # ============ Encode Prompt ============
-        # Handle multiple prompt types
-        if bbox is not None:
-            prompt_embed = self.prompt_encoder(bbox=bbox)
+        # Use coarse mask as primary prompt, fall back to external prompts
+        if coarse_mask is not None:
+            prompt_embed, confidence = self.prompt_encoder(
+                coarse_mask=coarse_mask,
+                illumination_map=illumination_map
+            )
+        elif bbox is not None:
+            prompt_embed, confidence = self.prompt_encoder(bbox=bbox)
         elif points is not None:
-            prompt_embed = self.prompt_encoder(points=points)
+            prompt_embed, confidence = self.prompt_encoder(points=points)
         elif mask_prompt is not None:
-            prompt_embed = self.prompt_encoder(mask=mask_prompt)
+            prompt_embed, confidence = self.prompt_encoder(mask=mask_prompt)
         else:
             # Use learnable prompt if no specific prompt provided
-            prompt_embed = self.prompt_encoder()
+            prompt_embed, confidence = self.prompt_encoder()
         
         # ============ Decode Segmentation ============
-        # Progressively upsample features to original resolution
-        logits, aux_logits = self.mask_decoder(features, prompt_embed)
+        # Progressively upsample features with multi-scale guidance from encoder
+        decoder_outputs = self.mask_decoder(
+            features,
+            prompt_embed,
+            encoder_outputs=encoder_outputs,
+            confidence=confidence
+        )
         
-        return logits, aux_logits
+        # ============ Return Results ============
+        return {
+            'logits': decoder_outputs['logits'],
+            'bg_logits': decoder_outputs['bg_logits'],
+            'aux_logits': decoder_outputs['aux_logits'],
+            'aux_bg_logits': decoder_outputs['aux_bg_logits'],
+            'coarse_masks': coarse_masks,
+            'confidence': confidence
+        }
     
     def get_model_summary(self):
         """Get model architecture summary.
@@ -139,7 +187,7 @@ class LiteMedSAM(nn.Module):
         model_size_mb = total_params * 4 / (1024**2)
         
         print("\n" + "="*70)
-        print("LiteMedSAM Model Summary")
+        print("LiteMedSAM Model Summary (PraNet-V2 + WTNet)")
         print("="*70)
         print(f"Total Parameters:      {total_params:>15,}")
         print(f"Trainable Parameters:  {trainable_params:>15,}")
@@ -149,6 +197,13 @@ class LiteMedSAM(nn.Module):
         print(f"  Image Encoder:  {sum(p.numel() for p in self.image_encoder.parameters()):,} params")
         print(f"  Prompt Encoder: {sum(p.numel() for p in self.prompt_encoder.parameters()):,} params")
         print(f"  Mask Decoder:   {sum(p.numel() for p in self.mask_decoder.parameters()):,} params")
+        print("="*70)
+        print("\nKey Innovations:")
+        print("  • Exposure Correction: WTNet-inspired illumination-invariant features")
+        print("  • Partial Decoder: Multi-scale coarse mask generation from encoder")
+        print("  • DSRA Modules: Dual-Supervised Reverse Attention for refinement")
+        print("  • Wise-Multiplication: Spatial features ⊙ (1 + exposure features)")
+        print("  • Dual Supervision: Background + foreground at each decoder level")
         print("="*70 + "\n")
         
         return total_params, trainable_params
