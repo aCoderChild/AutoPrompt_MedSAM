@@ -98,7 +98,7 @@ class ExposureCorrection(nn.Module):
             nn.Conv2d(in_channels // 2, out_channels, kernel_size=1)
         )
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract exposure correction features.
         
         Args:
@@ -106,15 +106,9 @@ class ExposureCorrection(nn.Module):
             
         Returns:
             exposure_feat: Exposure correction features [B, 3, H, W]
-            illumination_map: Illumination intensity map [B, 1, H, W]
         """
         exposure_feat = self.exposure_conv(x)
-        
-        # Compute illumination intensity as mean of exposure features
-        illumination = exposure_feat.mean(dim=1, keepdim=True)
-        illumination = torch.sigmoid(illumination)
-        
-        return exposure_feat, illumination
+        return exposure_feat
 
 
 class DualSupervisedReverseAttention(nn.Module):
@@ -222,7 +216,7 @@ class PartialDecoder(nn.Module):
         )
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate coarse masks and background/foreground predictions.
+        """Generate coarse mask and dual supervision masks from encoder features.
         
         Args:
             x: Input features [B, C, H, W]

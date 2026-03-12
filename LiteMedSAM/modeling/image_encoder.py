@@ -67,7 +67,7 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class LiteImageEncoder(nn.Module):
+class ImageEncoder(nn.Module):
     """Enhanced image encoder with PraNet-V2 architecture and exposure correction.
     
     Architecture:
@@ -85,8 +85,7 @@ class LiteImageEncoder(nn.Module):
     """
     
     def __init__(self, in_channels=1, out_channels=256, base_channels=32):
-        super(LiteImageEncoder, self).__init__()
-        
+        super(ImageEncoder, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.base_channels = base_channels
@@ -194,62 +193,59 @@ class LiteImageEncoder(nn.Module):
             
         Returns:
             features: Encoded features [B, out_channels, H/16, W/16]
-            exposure_features: List of exposure correction features at each scale
-            coarse_masks: List of coarse masks at each scale
-            dual_masks: Dict with 'bg' and 'fg' masks for dual supervision
+            coarse_mask: Final coarse mask [B, 1, H/16, W/16] from PartialDecoder
+            dual_masks: Dict with first dual supervision masks from PartialDecoder
+                - bg: [None, bg_mask_2, bg_mask_3, bg_mask_4] (stages 2,3,4 only)
+                - fg: [None, fg_mask_2, fg_mask_3, fg_mask_4] (stages 2,3,4 only)
             skip_connections: List of intermediate features for skip connections
+                Note: These intermediate features already contain fused exposure correction information
         """
         # Stem
         x0 = self.stem(x)  # 1/4 resolution
         
         # ============ Stage 1 ============
         x1 = self.layer1(x0)  # 1/4 resolution
-        exp_x1, illum_x1 = self.exposure_f2(x1)
+        exp_x1 = self.exposure_f2(x1)
         x1_fused = self.fusion_f2(x1, exp_x1)
-        coarse_mask_1, bg_mask_1, fg_mask_1 = self.pd_f2(x1_fused)
+        coarse_mask_1, _, _ = self.pd_f2(x1_fused)  # No dual masks from stage 1
         
         # ============ Stage 2 ============
         x2 = self.layer2(x1_fused)  # 1/8 resolution
-        exp_x2, illum_x2 = self.exposure_f3(x2)
+        exp_x2 = self.exposure_f3(x2)
         x2_fused = self.fusion_f3(x2, exp_x2)
-        coarse_mask_2, bg_mask_2, fg_mask_2 = self.pd_f3(x2_fused)
+        coarse_mask_2, bg_mask_2, fg_mask_2 = self.pd_f3(x2_fused)  # First dual masks from stage 2
         
         # ============ Stage 3 ============
         x3 = self.layer3(x2_fused)  # 1/16 resolution
-        exp_x3, illum_x3 = self.exposure_f4(x3)
+        exp_x3 = self.exposure_f4(x3)
         x3_fused = self.fusion_f4(x3, exp_x3)
-        coarse_mask_3, bg_mask_3, fg_mask_3 = self.pd_f4(x3_fused)
+        coarse_mask_3, bg_mask_3, fg_mask_3 = self.pd_f4(x3_fused)  # First dual masks from stage 3
         
         # ============ Stage 4 ============
         x4 = self.layer4(x3_fused)  # 1/16 resolution
-        exp_x4, illum_x4 = self.exposure_final(x4)
+        exp_x4 = self.exposure_final(x4)
         x4_fused = self.fusion_final(x4, exp_x4)
         
         # Final projection
         features = self.final_proj(x4_fused)  # 1/16 resolution
-        coarse_mask_4, bg_mask_4, fg_mask_4 = self.pd_final(features)
+        coarse_mask_4, bg_mask_4, fg_mask_4 = self.pd_final(features)  # First dual masks from encoder stage 4
         
-        # Store all coarse masks
-        coarse_masks = [coarse_mask_1, coarse_mask_2, coarse_mask_3, coarse_mask_4]
+        # Store only the final coarse mask from PartialDecoder
+        coarse_masks = coarse_mask_4
         
-        # Store dual supervision masks
+        # Store first dual supervision masks (from PartialDecoder on stages 2, 3, 4)
+        # Stage 1 has no dual masks from PartialDecoder
         dual_masks = {
-            'bg': [bg_mask_1, bg_mask_2, bg_mask_3, bg_mask_4],
-            'fg': [fg_mask_1, fg_mask_2, fg_mask_3, fg_mask_4]
+            'bg': [None, bg_mask_2, bg_mask_3, bg_mask_4],
+            'fg': [None, fg_mask_2, fg_mask_3, fg_mask_4]
         }
         
-        # Store exposure correction features
-        exposure_features = [exp_x1, exp_x2, exp_x3, exp_x4]
-        illumination_maps = [illum_x1, illum_x2, illum_x3, illum_x4]
-        
-        # Store skip connections for decoder
+        # Store skip connections for decoder (already contain fused exposure correction features)
         skip_connections = [x1_fused, x2_fused, x3_fused, x4_fused]
         
         return {
             'features': features,
-            'coarse_masks': coarse_masks,  # For prompt encoder
-            'dual_masks': dual_masks,  # For mask decoder guidance
-            'exposure_features': exposure_features,
-            'illumination_maps': illumination_maps,
+            'coarse_masks': coarse_masks,
+            'dual_masks': dual_masks,
             'skip_connections': skip_connections
         }

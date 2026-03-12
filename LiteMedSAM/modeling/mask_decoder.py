@@ -134,10 +134,12 @@ class LiteDecoder(nn.Module):
             x: Image features [B, input_dim, H/16, W/16]
             prompt_embed: Encoded prompt embeddings [B, embed_dim]
             encoder_outputs: Dict containing:
-                - coarse_masks: List of coarse masks at each scale
-                - dual_masks: Dict with 'bg' and 'fg' masks
-                - exposure_features: List of exposure correction features
-                - skip_connections: Skip connections from encoder
+                - coarse_masks: Final coarse mask from PartialDecoder [B, 1, H/16, W/16]
+                - dual_masks: Dict with 'bg' and 'fg' masks from PartialDecoder (stages 2,3,4 only)
+                  - Format: {'bg': [None, bg_2, bg_3, bg_4], 'fg': [None, fg_2, fg_3, fg_4]}
+                  - Stage 1 has None (no PartialDecoder dual masks at stage 1)
+                  - DSRA modules will generate additional attention masks internally
+                - skip_connections: Skip connections from encoder (with fused exposure features)
             confidence: Confidence score of prompt
             
         Returns:
@@ -151,9 +153,8 @@ class LiteDecoder(nn.Module):
         # Default encoder outputs if not provided
         if encoder_outputs is None:
             encoder_outputs = {
-                'coarse_masks': [None, None, None, None],
+                'coarse_masks': None,
                 'dual_masks': {'bg': [None, None, None, None], 'fg': [None, None, None, None]},
-                'exposure_features': [None, None, None, None],
                 'skip_connections': [None, None, None, None]
             }
         
@@ -182,8 +183,9 @@ class LiteDecoder(nn.Module):
         
         # Fuse with skip connection and exposure features if available
         skip_1 = encoder_outputs['skip_connections'][1] if encoder_outputs['skip_connections'][1] is not None else torch.zeros_like(up1)
-        exp_feat_1 = encoder_outputs['exposure_features'][1] if encoder_outputs['exposure_features'][1] is not None else torch.zeros(
-            batch_size, 3, up1.shape[2], up1.shape[3], device=up1.device
+        # Exposure features are now fused into skip_connections during encoding, so we generate fallback zeros if needed
+        exp_feat_1 = torch.zeros(
+            batch_size, 3, up1.shape[2], up1.shape[3], device=up1.device, dtype=up1.dtype
         )
         up1 = up1 + skip_1
         up1 = self.skip_fusion1(up1, exp_feat_1)
@@ -199,8 +201,9 @@ class LiteDecoder(nn.Module):
         
         # Fuse with skip connection and exposure features
         skip_0 = encoder_outputs['skip_connections'][0] if encoder_outputs['skip_connections'][0] is not None else torch.zeros_like(up2)
-        exp_feat_0 = encoder_outputs['exposure_features'][0] if encoder_outputs['exposure_features'][0] is not None else torch.zeros(
-            batch_size, 3, up2.shape[2], up2.shape[3], device=up2.device
+        # Exposure features are now fused into skip_connections during encoding, so we generate fallback zeros if needed
+        exp_feat_0 = torch.zeros(
+            batch_size, 3, up2.shape[2], up2.shape[3], device=up2.device, dtype=up2.dtype
         )
         up2 = up2 + skip_0
         up2 = self.skip_fusion2(up2, exp_feat_0)
@@ -220,9 +223,10 @@ class LiteDecoder(nn.Module):
         up3 = self.upsample3(up2)  # Full resolution (1x)
         
         # ============ Decode Exposure Correction Features ============
-        # Get final exposure features and integrate them
-        exp_feat_final = encoder_outputs['exposure_features'][3] if encoder_outputs['exposure_features'][3] is not None else torch.zeros(
-            batch_size, 3, 16, 16, device=up3.device
+        # Exposure features are now fused during encoding into skip_connections
+        # Create zero feature placeholder for final exposure decoding
+        exp_feat_final = torch.zeros(
+            batch_size, 3, 16, 16, device=up3.device, dtype=up3.dtype
         )
         # Upsample exposure features to match full resolution
         exp_feat_final = F.interpolate(

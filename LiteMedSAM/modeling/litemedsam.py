@@ -9,7 +9,7 @@ from .mask_decoder import LiteDecoder
 
 
 class LiteMedSAM(nn.Module):
-    """Lightweight Medical Segment Anything Model with PraNet-V2 + WTNet.
+    """Lightweight Medical Segment Anything Model modified with PraNet-V2 + WTNet.
     
     Integrates:
     - PraNet-V2 encoder-decoder architecture with DSRA modules
@@ -118,7 +118,7 @@ class LiteMedSAM(nn.Module):
                 - 'bg_logits': Background logits [B, 1, H, W]
                 - 'aux_logits': Auxiliary foreground output at 1/4 resolution
                 - 'aux_bg_logits': Auxiliary background output at 1/4 resolution
-                - 'coarse_masks': List of coarse masks from encoder
+                - 'coarse_masks': Final coarse mask from encoder [B, 1, H/16, W/16]
                 - 'confidence': Prompt confidence score
             
         Note:
@@ -131,20 +131,12 @@ class LiteMedSAM(nn.Module):
         # Extract multi-scale features from input
         encoder_outputs = self.image_encoder(image)
         features = encoder_outputs['features']  # [B, embed_dim, H/16, W/16]
-        coarse_masks = encoder_outputs['coarse_masks']
-        illumination_maps = encoder_outputs['illumination_maps']
-        
-        # Get coarse mask from most detailed level (last one at highest resolution)
-        coarse_mask = coarse_masks[-1] if coarse_masks[-1] is not None else None
-        illumination_map = illumination_maps[-1] if illumination_maps[-1] is not None else None
+        coarse_mask = encoder_outputs['coarse_masks']  # Final coarse mask from PartialDecoder
         
         # ============ Encode Prompt ============
         # Use coarse mask as primary prompt, fall back to external prompts
         if coarse_mask is not None:
-            prompt_embed, confidence = self.prompt_encoder(
-                coarse_mask=coarse_mask,
-                illumination_map=illumination_map
-            )
+            prompt_embed, confidence = self.prompt_encoder(coarse_mask=coarse_mask)
         elif bbox is not None:
             prompt_embed, confidence = self.prompt_encoder(bbox=bbox)
         elif points is not None:
@@ -170,7 +162,7 @@ class LiteMedSAM(nn.Module):
             'bg_logits': decoder_outputs['bg_logits'],
             'aux_logits': decoder_outputs['aux_logits'],
             'aux_bg_logits': decoder_outputs['aux_bg_logits'],
-            'coarse_masks': coarse_masks,
+            'coarse_masks': coarse_mask,
             'confidence': confidence
         }
     
