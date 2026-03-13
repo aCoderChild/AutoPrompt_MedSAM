@@ -7,18 +7,20 @@ from .common import DualSupervisedReverseAttention, FeatureFusion
 
 
 class LiteDecoder(nn.Module):
-    """Enhanced decoder with DSRA modules and exposure correction (PraNet-V2 inspired).
+    """Enhanced decoder with DSRA modules, UNet-style skip connections, and exposure correction (PraNet-V2).
     
     Architecture:
     - Prompt fusion: Combine features with prompt embedding
     - Multi-scale guidance: Use coarse masks from encoder as supervision
+    - UNet-style skip connections: Concatenate encoder features with decoder features at each level
     - DSRA modules: Dual-Supervised Reverse Attention for feature refinement
     - Exposure correction decoding: Integrate exposure features with spatial features
     - Progressive upsampling: 4x upsampling (1/16 -> 1/8 -> 1/4 -> 1/)
     - Dual supervision: Background and foreground supervision at each level
     
     Design focuses on:
-    - Multi-scale feature guidance from encoder
+    - Multi-scale feature guidance from encoder (like UNet)
+    - Learnable feature fusion via concatenation and 3x3 convolutions
     - Dual supervision for robust mask learning
     - Exposure correction feature integration
     - Hierarchical decoding with DSRA refinement
@@ -57,7 +59,14 @@ class LiteDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # ============ Feature fusion with skip connection ============
+        # ============ UNet-Style Skip Connection Fusion (1/8) ============
+        # Concatenate decoder features with skip connection from encoder stage 3
+        # Then reduce channels back to hidden_dim // 2
+        self.skip_concat1 = nn.Sequential(
+            nn.Conv2d((hidden_dim // 2) + (base_channels * 4), hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.ReLU(inplace=True)
+        )
         self.skip_fusion1 = FeatureFusion(hidden_dim // 2, exposure_channels=3)
         
         # ============ DSRA Module 2 (1/8 resolution) ============
@@ -71,16 +80,32 @@ class LiteDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # ============ Feature fusion with skip connection ============
+        # ============ UNet-Style Skip Connection Fusion (1/4) ============
+        # Concatenate decoder features with skip connection from encoder stage 2
+        # Then reduce channels back to hidden_dim // 4
+        self.skip_concat2 = nn.Sequential(
+            nn.Conv2d((hidden_dim // 4) + (base_channels * 2), hidden_dim // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 4),
+            nn.ReLU(inplace=True)
+        )
         self.skip_fusion2 = FeatureFusion(hidden_dim // 4, exposure_channels=3)
         
         # ============ DSRA Module 3 (1/4 resolution) ============
         self.dsra3 = DualSupervisedReverseAttention(hidden_dim // 4, hidden_dim // 4)
         
-        # ============ Upsampling to full resolution ============
+        # ============ Upsampling to full resolution (1x) ============
         self.upsample3 = nn.Sequential(
             nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
             nn.Conv2d(hidden_dim // 4, hidden_dim // 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 8),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ============ UNet-Style Skip Connection Fusion (1x full resolution) ============
+        # Concatenate decoder features with skip connection from encoder stage 1
+        # Then reduce channels back to hidden_dim // 8
+        self.skip_concat3 = nn.Sequential(
+            nn.Conv2d((hidden_dim // 8) + (base_channels), hidden_dim // 8, kernel_size=3, padding=1),
             nn.BatchNorm2d(hidden_dim // 8),
             nn.ReLU(inplace=True)
         )
@@ -181,13 +206,20 @@ class LiteDecoder(nn.Module):
         # ============ Upsampling to 1/8 ============
         up1 = self.upsample1(refined)  # 1/8 resolution
         
-        # Fuse with skip connection and exposure features if available
-        skip_1 = encoder_outputs['skip_connections'][1] if encoder_outputs['skip_connections'][1] is not None else torch.zeros_like(up1)
-        # Exposure features are now fused into skip_connections during encoding, so we generate fallback zeros if needed
+        # ============ UNet-Style Skip Connection Fusion (1/8) ============
+        # Concatenate upsampled decoder features with encoder stage 3 skip
+        skip_3 = encoder_outputs['skip_connections'][2] if encoder_outputs['skip_connections'][2] is not None else torch.zeros_like(up1)
+        # Resize skip connection to match decoder feature map size if needed
+        if skip_3.shape[2:] != up1.shape[2:]:
+            skip_3 = F.interpolate(skip_3, size=up1.shape[2:], mode='bilinear', align_corners=False)
+        # Concatenate and fuse encoder + decoder features
+        up1_concat = torch.cat([up1, skip_3], dim=1)
+        up1 = self.skip_concat1(up1_concat)
+        
+        # Exposure features are now fused into skip_connections during encoding
         exp_feat_1 = torch.zeros(
             batch_size, 3, up1.shape[2], up1.shape[3], device=up1.device, dtype=up1.dtype
         )
-        up1 = up1 + skip_1
         up1 = self.skip_fusion1(up1, exp_feat_1)
         
         # ============ Decoder Level 2 (1/8 resolution) ============
@@ -206,13 +238,20 @@ class LiteDecoder(nn.Module):
         # ============ Upsampling to 1/4 ============
         up2 = self.upsample2(up1)  # 1/4 resolution
         
-        # Fuse with skip connection and exposure features
-        skip_0 = encoder_outputs['skip_connections'][0] if encoder_outputs['skip_connections'][0] is not None else torch.zeros_like(up2)
-        # Exposure features are now fused into skip_connections during encoding, so we generate fallback zeros if needed
+        # ============ UNet-Style Skip Connection Fusion (1/4) ============
+        # Concatenate upsampled decoder features with encoder stage 2 skip
+        skip_2 = encoder_outputs['skip_connections'][1] if encoder_outputs['skip_connections'][1] is not None else torch.zeros_like(up2)
+        # Resize skip connection to match decoder feature map size if needed
+        if skip_2.shape[2:] != up2.shape[2:]:
+            skip_2 = F.interpolate(skip_2, size=up2.shape[2:], mode='bilinear', align_corners=False)
+        # Concatenate and fuse encoder + decoder features
+        up2_concat = torch.cat([up2, skip_2], dim=1)
+        up2 = self.skip_concat2(up2_concat)
+        
+        # Exposure features are now fused into skip_connections during encoding
         exp_feat_0 = torch.zeros(
             batch_size, 3, up2.shape[2], up2.shape[3], device=up2.device, dtype=up2.dtype
         )
-        up2 = up2 + skip_0
         up2 = self.skip_fusion2(up2, exp_feat_0)
         
         # ============ Decoder Level 3 (1/4 resolution) ============
@@ -235,6 +274,16 @@ class LiteDecoder(nn.Module):
         
         # ============ Upsampling to Full Resolution ============
         up3 = self.upsample3(up2)  # Full resolution (1x)
+        
+        # ============ UNet-Style Skip Connection Fusion (1x full resolution) ============
+        # Concatenate upsampled decoder features with encoder stage 1 skip
+        skip_1 = encoder_outputs['skip_connections'][0] if encoder_outputs['skip_connections'][0] is not None else torch.zeros_like(up3)
+        # Resize skip connection to match decoder feature map size if needed
+        if skip_1.shape[2:] != up3.shape[2:]:
+            skip_1 = F.interpolate(skip_1, size=up3.shape[2:], mode='bilinear', align_corners=False)
+        # Concatenate and fuse encoder + decoder features
+        up3_concat = torch.cat([up3, skip_1], dim=1)
+        up3 = self.skip_concat3(up3_concat)
         
         # ============ Decode Exposure Correction Features ============
         # Exposure features are now fused during encoding into skip_connections
