@@ -146,22 +146,31 @@ class ImageEncoder(nn.Module):
         
         # ============ Feature Aggregation for Partial Decoder ============
         # Aggregate features from stages 2, 3, 4 before applying PartialDecoder
-        # Upsample lower resolution features to match stage 4 resolution (1/16)
+        # IMPROVED: Bottleneck aggregation for efficiency + residual connections
+        
+        # Stage 2 features (1/8 -> 1/16): 64 channels -> 64 channels (bottleneck)
         self.agg_f2_to_f4 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 1/8 -> 1/16
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=1),
-            nn.BatchNorm2d(base_channels * 4),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),  # Bottleneck
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=1),  # Project to 128
+            nn.BatchNorm2d(base_channels * 4)
         )
+        
+        # Stage 3 features (1/16): 128 channels -> 128 channels (identity)
         self.agg_f3_to_f4 = nn.Sequential(
-            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=1),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_channels * 4),
             nn.ReLU(inplace=True)
         )
+        
+        # Fusion: Combine aggregated features with residual connection
         self.agg_fusion = nn.Sequential(
-            nn.Conv2d(base_channels * 4 * 2, base_channels * 4, kernel_size=1),
+            nn.Conv2d(base_channels * 4 * 2, base_channels * 4, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_channels * 4),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=1)
         )
         
         # ============ Partial Decoder (PD) Module ============
@@ -209,13 +218,17 @@ class ImageEncoder(nn.Module):
             x: Input image [B, C, H, W]
             
         Returns:
-            features: Encoded features [B, out_channels, H/16, W/16]
-            coarse_masks: Coarse mask [B, 1, H/16, W/16] from aggregated PartialDecoder
-            dual_masks: Dict with dual supervision masks (bg/fg) from PartialDecoder
-                - bg: 1.0 - coarse_mask
-                - fg: coarse_mask
-            skip_connections: List of intermediate features for skip connections
-                Note: These intermediate features already contain fused exposure correction information
+            dict containing:
+                - features: Encoded features [B, out_channels, H/16, W/16]
+                - coarse_masks: Coarse mask [B, 1, H/16, W/16] from aggregated PartialDecoder
+                - dual_masks: Dict with dual supervision masks (bg/fg) from PartialDecoder
+                    - bg: 1.0 - coarse_mask
+                    - fg: coarse_mask
+                - skip_connections: List of intermediate features [x1, x2, x3, x4]
+                    Note: These already contain fused exposure correction information
+                - debug_info: Dict with architectural information (IMPROVED)
+                    - stage_shapes: Shapes at each encoder stage
+                    - skip_connection_channels: Channel counts for skip connections
         """
         # Stem
         x0 = self.stem(x)  # 1/4 resolution
@@ -242,13 +255,18 @@ class ImageEncoder(nn.Module):
         
         # ============ Feature Aggregation ============
         # Aggregate multi-scale features from stages 2, 3, 4 (all at 1/16 resolution)
-        x2_agg = self.agg_f2_to_f4(x2_fused)  # Upsample stage 2 from 1/8 to 1/16
-        x3_agg = self.agg_f3_to_f4(x3_fused)  # Process stage 3 at 1/16
-        x4_agg = x4_fused
+        # IMPROVED: Bottleneck processing + residual connections for better gradient flow
         
-        # Concatenate and fuse aggregated features
-        agg_concat = torch.cat([x2_agg + x3_agg, x4_agg], dim=1)  # Combine aggregated features
-        agg_features = self.agg_fusion(agg_concat)  # [B, 128, H/16, W/16]
+        x2_agg = self.agg_f2_to_f4(x2_fused)  # Upsample stage 2 from 1/8 to 1/16 (bottleneck)
+        x3_agg = self.agg_f3_to_f4(x3_fused)  # Process stage 3 at 1/16 (skip-aware)
+        x4_agg = x4_fused  # Stage 4 identity
+        
+        # Concatenate and fuse with residual connection to original stage 4
+        agg_concat = torch.cat([x2_agg + x3_agg, x4_agg], dim=1)
+        agg_fused = self.agg_fusion(agg_concat)
+        
+        # Residual connection: Preserve original stage 4 information
+        agg_features = agg_fused + x4_agg  # Blend aggregated output with stage 4
         
         # ============ Partial Decoder on Aggregated Features ============
         # Apply PartialDecoder only once on aggregated features from stages 2, 3, 4
@@ -267,9 +285,23 @@ class ImageEncoder(nn.Module):
         # Store skip connections for decoder (already contain fused exposure correction features)
         skip_connections = [x1_fused, x2_fused, x3_fused, x4_fused]
         
+        # IMPROVED: Add debug info for model analysis
+        debug_info = {
+            'stage_shapes': {
+                'stem': x0.shape,
+                'stage1': x1_fused.shape,
+                'stage2': x2_fused.shape,
+                'stage3': x3_fused.shape,
+                'stage4': x4_fused.shape,
+                'aggregated': agg_features.shape,
+            },
+            'skip_connection_channels': [s.shape[1] for s in skip_connections],
+        }
+        
         return {
             'features': features,
             'coarse_masks': coarse_masks,
             'dual_masks': dual_masks,
-            'skip_connections': skip_connections
+            'skip_connections': skip_connections,
+            'debug_info': debug_info
         }

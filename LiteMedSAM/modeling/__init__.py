@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 # Lightweight Medical Segment Anything Model with PraNet-V2 + WTNet
 
-from .litemedmsam import LiteMedSAM
+from .litemedsam import LiteMedSAM
 from .image_encoder import LiteImageEncoder, ResidualBlock
 from .prompt_encoder import PromptEncoder
 from .mask_decoder import LiteDecoder
