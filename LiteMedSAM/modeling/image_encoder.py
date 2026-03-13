@@ -142,14 +142,31 @@ class ImageEncoder(nn.Module):
         self.exposure_f2 = ExposureCorrection(base_channels)
         self.exposure_f3 = ExposureCorrection(base_channels * 2)
         self.exposure_f4 = ExposureCorrection(base_channels * 4)
-        self.exposure_final = ExposureCorrection(base_channels * 4)  # x4 has base_channels*4 channels before projection
+        self.exposure_final = ExposureCorrection(base_channels * 4)
         
-        # ============ Partial Decoder (PD) Modules ============
-        # Generate coarse masks from each stage features
-        self.pd_f2 = PartialDecoder(base_channels, out_channels=1)
-        self.pd_f3 = PartialDecoder(base_channels * 2, out_channels=1)
-        self.pd_f4 = PartialDecoder(base_channels * 4, out_channels=1)
-        self.pd_final = PartialDecoder(out_channels, out_channels=1)
+        # ============ Feature Aggregation for Partial Decoder ============
+        # Aggregate features from stages 2, 3, 4 before applying PartialDecoder
+        # Upsample lower resolution features to match stage 4 resolution (1/16)
+        self.agg_f2_to_f4 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 1/8 -> 1/16
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.agg_f3_to_f4 = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.agg_fusion = nn.Sequential(
+            nn.Conv2d(base_channels * 4 * 2, base_channels * 4, kernel_size=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ============ Partial Decoder (PD) Module ============
+        # Apply only after stage 4 on aggregated features from stages 2, 3, 4
+        self.pd_final = PartialDecoder(base_channels * 4, out_channels=1)
         
         # ============ Feature Fusion Modules ============
         # Fuse spatial features with exposure correction features
@@ -186,17 +203,17 @@ class ImageEncoder(nn.Module):
         return nn.Sequential(*layers)
     
     def forward(self, x):
-        """Extract multi-scale features with exposure correction and coarse masks.
+        """Extract multi-scale features with exposure correction and aggregated coarse mask.
         
         Args:
             x: Input image [B, C, H, W]
             
         Returns:
             features: Encoded features [B, out_channels, H/16, W/16]
-            coarse_mask: Final coarse mask [B, 1, H/16, W/16] from PartialDecoder
-            dual_masks: Dict with first dual supervision masks from PartialDecoder
-                - bg: [None, bg_mask_2, bg_mask_3, bg_mask_4] (stages 2,3,4 only)
-                - fg: [None, fg_mask_2, fg_mask_3, fg_mask_4] (stages 2,3,4 only)
+            coarse_masks: Coarse mask [B, 1, H/16, W/16] from aggregated PartialDecoder
+            dual_masks: Dict with dual supervision masks (bg/fg) from PartialDecoder
+                - bg: 1.0 - coarse_mask
+                - fg: coarse_mask
             skip_connections: List of intermediate features for skip connections
                 Note: These intermediate features already contain fused exposure correction information
         """
@@ -207,37 +224,44 @@ class ImageEncoder(nn.Module):
         x1 = self.layer1(x0)  # 1/4 resolution
         exp_x1 = self.exposure_f2(x1)
         x1_fused = self.fusion_f2(x1, exp_x1)
-        coarse_mask_1, _, _ = self.pd_f2(x1_fused)  # No dual masks from stage 1
         
         # ============ Stage 2 ============
         x2 = self.layer2(x1_fused)  # 1/8 resolution
         exp_x2 = self.exposure_f3(x2)
         x2_fused = self.fusion_f3(x2, exp_x2)
-        coarse_mask_2, bg_mask_2, fg_mask_2 = self.pd_f3(x2_fused)  # First dual masks from stage 2
         
         # ============ Stage 3 ============
         x3 = self.layer3(x2_fused)  # 1/16 resolution
         exp_x3 = self.exposure_f4(x3)
         x3_fused = self.fusion_f4(x3, exp_x3)
-        coarse_mask_3, bg_mask_3, fg_mask_3 = self.pd_f4(x3_fused)  # First dual masks from stage 3
         
         # ============ Stage 4 ============
         x4 = self.layer4(x3_fused)  # 1/16 resolution
         exp_x4 = self.exposure_final(x4)
         x4_fused = self.fusion_final(x4, exp_x4)
         
+        # ============ Feature Aggregation ============
+        # Aggregate multi-scale features from stages 2, 3, 4 (all at 1/16 resolution)
+        x2_agg = self.agg_f2_to_f4(x2_fused)  # Upsample stage 2 from 1/8 to 1/16
+        x3_agg = self.agg_f3_to_f4(x3_fused)  # Process stage 3 at 1/16
+        x4_agg = x4_fused
+        
+        # Concatenate and fuse aggregated features
+        agg_concat = torch.cat([x2_agg + x3_agg, x4_agg], dim=1)  # Combine aggregated features
+        agg_features = self.agg_fusion(agg_concat)  # [B, 128, H/16, W/16]
+        
+        # ============ Partial Decoder on Aggregated Features ============
+        # Apply PartialDecoder only once on aggregated features from stages 2, 3, 4
+        coarse_mask, bg_mask, fg_mask = self.pd_final(agg_features)
+        
         # Final projection
         features = self.final_proj(x4_fused)  # 1/16 resolution
-        coarse_mask_4, bg_mask_4, fg_mask_4 = self.pd_final(features)  # First dual masks from encoder stage 4
         
-        # Store only the final coarse mask from PartialDecoder
-        coarse_masks = coarse_mask_4
-        
-        # Store first dual supervision masks (from PartialDecoder on stages 2, 3, 4)
-        # Stage 1 has no dual masks from PartialDecoder
+        # Store coarse mask and dual supervision masks
+        coarse_masks = coarse_mask
         dual_masks = {
-            'bg': [None, bg_mask_2, bg_mask_3, bg_mask_4],
-            'fg': [None, fg_mask_2, fg_mask_3, fg_mask_4]
+            'bg': bg_mask,
+            'fg': fg_mask
         }
         
         # Store skip connections for decoder (already contain fused exposure correction features)

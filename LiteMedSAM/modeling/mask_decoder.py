@@ -134,10 +134,10 @@ class LiteDecoder(nn.Module):
             x: Image features [B, input_dim, H/16, W/16]
             prompt_embed: Encoded prompt embeddings [B, embed_dim]
             encoder_outputs: Dict containing:
-                - coarse_masks: Final coarse mask from PartialDecoder [B, 1, H/16, W/16]
-                - dual_masks: Dict with 'bg' and 'fg' masks from PartialDecoder (stages 2,3,4 only)
-                  - Format: {'bg': [None, bg_2, bg_3, bg_4], 'fg': [None, fg_2, fg_3, fg_4]}
-                  - Stage 1 has None (no PartialDecoder dual masks at stage 1)
+                - coarse_masks: Final coarse mask from aggregated PartialDecoder [B, 1, H/16, W/16]
+                - dual_masks: Dict with 'bg' and 'fg' masks from aggregated PartialDecoder at 1/16
+                  - Format: {'bg': torch.Tensor [B,1,H/16,W/16], 'fg': torch.Tensor [B,1,H/16,W/16]}
+                  - Single aggregated mask from stages 2,3,4 at PartialDecoder output
                   - DSRA modules will generate additional attention masks internally
                 - skip_connections: Skip connections from encoder (with fused exposure features)
             confidence: Confidence score of prompt
@@ -154,7 +154,7 @@ class LiteDecoder(nn.Module):
         if encoder_outputs is None:
             encoder_outputs = {
                 'coarse_masks': None,
-                'dual_masks': {'bg': [None, None, None, None], 'fg': [None, None, None, None]},
+                'dual_masks': {'bg': None, 'fg': None},
                 'skip_connections': [None, None, None, None]
             }
         
@@ -171,9 +171,9 @@ class LiteDecoder(nn.Module):
         
         # ============ Decoder Level 1 (1/16 resolution) ============
         # Get dual supervision masks for DSRA
-        # Use mask[3] or mask[2] (both at 1/16 after removing upsampling from PartialDecoder)
-        bg_mask_1 = encoder_outputs['dual_masks']['bg'][3] if encoder_outputs['dual_masks']['bg'][3] is not None else torch.zeros_like(refined[:, :1])
-        fg_mask_1 = encoder_outputs['dual_masks']['fg'][3] if encoder_outputs['dual_masks']['fg'][3] is not None else torch.ones_like(refined[:, :1])
+        # Use aggregated masks from PartialDecoder at 1/16 resolution
+        bg_mask_1 = encoder_outputs['dual_masks']['bg'] if encoder_outputs['dual_masks']['bg'] is not None else torch.zeros_like(refined[:, :1])
+        fg_mask_1 = encoder_outputs['dual_masks']['fg'] if encoder_outputs['dual_masks']['fg'] is not None else torch.ones_like(refined[:, :1])
         
         # Apply DSRA with dual supervision
         refined = self.dsra1(refined, bg_mask_1, fg_mask_1)
@@ -191,8 +191,15 @@ class LiteDecoder(nn.Module):
         up1 = self.skip_fusion1(up1, exp_feat_1)
         
         # ============ Decoder Level 2 (1/8 resolution) ============
-        bg_mask_2 = encoder_outputs['dual_masks']['bg'][1] if encoder_outputs['dual_masks']['bg'][1] is not None else torch.zeros_like(up1[:, :1])
-        fg_mask_2 = encoder_outputs['dual_masks']['fg'][1] if encoder_outputs['dual_masks']['fg'][1] is not None else torch.ones_like(up1[:, :1])
+        # Upsample aggregated masks from 1/16 to 1/8 for DSRA
+        bg_mask_2 = F.interpolate(
+            bg_mask_1, size=(up1.shape[2], up1.shape[3]), 
+            mode='bilinear', align_corners=False
+        ) if encoder_outputs['dual_masks']['bg'] is not None else torch.zeros_like(up1[:, :1])
+        fg_mask_2 = F.interpolate(
+            fg_mask_1, size=(up1.shape[2], up1.shape[3]), 
+            mode='bilinear', align_corners=False
+        ) if encoder_outputs['dual_masks']['fg'] is not None else torch.ones_like(up1[:, :1])
         
         up1 = self.dsra2(up1, bg_mask_2, fg_mask_2)
         
@@ -209,8 +216,15 @@ class LiteDecoder(nn.Module):
         up2 = self.skip_fusion2(up2, exp_feat_0)
         
         # ============ Decoder Level 3 (1/4 resolution) ============
-        bg_mask_0 = encoder_outputs['dual_masks']['bg'][0] if encoder_outputs['dual_masks']['bg'][0] is not None else torch.zeros_like(up2[:, :1])
-        fg_mask_0 = encoder_outputs['dual_masks']['fg'][0] if encoder_outputs['dual_masks']['fg'][0] is not None else torch.ones_like(up2[:, :1])
+        # Upsample aggregated masks from 1/16 to 1/4 for DSRA
+        bg_mask_0 = F.interpolate(
+            bg_mask_1, size=(up2.shape[2], up2.shape[3]), 
+            mode='bilinear', align_corners=False
+        ) if encoder_outputs['dual_masks']['bg'] is not None else torch.zeros_like(up2[:, :1])
+        fg_mask_0 = F.interpolate(
+            fg_mask_1, size=(up2.shape[2], up2.shape[3]), 
+            mode='bilinear', align_corners=False
+        ) if encoder_outputs['dual_masks']['fg'] is not None else torch.ones_like(up2[:, :1])
         
         up2 = self.dsra3(up2, bg_mask_0, fg_mask_0)
         
